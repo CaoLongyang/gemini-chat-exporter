@@ -1,21 +1,35 @@
+// == Gemini Chat Exporter (API edition) ==
 // == Gemini 聊天记录导出脚本（接口版）==
-// 直接调用 Gemini 网页自己用的内部接口导出，不再点击、滚动页面。
-//  · 每条消息都带时间
-//  · 不依赖页面渲染：标签页放后台、窗口最小化也能跑
-//  · 不需要展开侧边栏，自动翻页拿到全部对话
-//  · 断点续传 + 增量更新：再次运行只导出新对话和有更新的对话
 //
-// 用法：
+// Exports every Google Gemini conversation by calling the same internal endpoints the Gemini
+// web app itself uses — no clicking, no scrolling.
+//  · Every message carries a timestamp
+//  · Independent of page rendering: keeps working in a background tab or a minimized window
+//  · No need to expand the sidebar; it paginates to get the complete conversation list
+//  · Resumable + incremental: a second run only exports new and updated conversations
+//
+// How to use
+// 1. Open https://gemini.google.com/app in Chrome or Edge and sign in
+//    (with several Google accounts, switch to the one you want to export first)
+// 2. F12 → Console, paste this whole file, press Enter
+// 3. Pick a mode. You can switch tabs or minimize afterwards; files download when it finishes
+//
+// Modes
+//   1 = JSON packed into a ZIP (one .json per conversation)
+//   2 = Markdown packed into a ZIP (one .md per conversation)
+//   3 = JSON merged into one file
+//   4 = Markdown merged into one file
+//   5 = verify: read the open conversation through the API and compare it with the page
+//       (run this once on a very long conversation before a full export)
+//
+// Language
+//   Follows your browser language automatically. Chinese browsers get Chinese UI, everything
+//   else gets English. Force it before running with:  window.__GX_LANG__ = 'en'   (or 'zh')
+//
+// 用法（中文）：
 // 1. Edge/Chrome 打开并登录 https://gemini.google.com/app （多账号时进入你要导出的那个账号）
 // 2. F12 → Console，粘贴本文件全部内容，回车
 // 3. 选择模式。之后可以切走、最小化，导完自动下载
-//
-// 模式：
-//   1 = JSON 打包 ZIP（每个对话一个 .json）
-//   2 = Markdown 打包 ZIP（每个对话一个 .md）
-//   3 = JSON 合并成一个文件
-//   4 = Markdown 合并成一个文件
-//   5 = 校验：用接口导出当前打开的对话，并和页面上显示的消息数对比（建议先在一个很长的对话里跑一次）
 //
 // 注意：这是 Gemini 未公开的内部接口，Google 改版后可能失效。
 //       Edge 请在 edge://settings/system 里把 gemini.google.com 加入"从不让这些站点进入睡眠状态"，
@@ -24,7 +38,155 @@
 (async function () {
   'use strict';
 
-  if (window.__GX_API_RUNNING__) { alert('导出脚本已经在运行了'); return; }
+  // ==================== 语言 / Language ====================
+  // 跟随浏览器语言；也可以在运行前执行 window.__GX_LANG__ = 'en' / 'zh' 强制指定。
+  // Follows the browser language; force it with window.__GX_LANG__ = 'en' / 'zh' before running.
+  const LANG = (() => {
+    const forced = window.__GX_LANG__;
+    if (forced === 'en' || forced === 'zh') return forced;
+    const l = (navigator.languages && navigator.languages[0]) || navigator.language || '';
+    return /^zh/i.test(l) ? 'zh' : 'en';
+  })();
+
+  const T = LANG === 'zh' ? {
+    locale: 'zh-CN',
+    alreadyRunning: '导出脚本已经在运行了',
+    wrongHost: '请在 https://gemini.google.com 页面运行',
+    noToken: '页面上找不到登录令牌，请确认已登录，并刷新页面后再运行',
+    panelTitle: 'Gemini 导出（接口版）',
+    preparing: '准备中…',
+    preparingAction: '准备中',
+    stop: '停止并保存已导出部分',
+    stopping: '正在收尾并生成文件…',
+    keepAwake: '🔊 防止 Edge 休眠',
+    keepAwakeTitle: '播放几乎听不到的声音，浏览器不会冻结正在播放声音的标签页',
+    keepOn: '✅ 已开启',
+    keepFail: '开启失败',
+    beat: (action, sec) => `正在：${action} · 最后活动 ${sec}s 前`,
+    requestAction: (rpcid, n) => `请求 ${rpcid}（第 ${n} 次）`,
+    authExpired: (s) => `登录已失效（HTTP ${s}），请刷新页面后重新运行（进度不会丢）`,
+    badFormat: '返回格式无法解析',
+    apiError: (e) => '接口返回错误 ' + e,
+    timeout: (s) => `请求超过 ${s}s 没有响应`,
+    requestFailed: '请求失败',
+    retryWarn: (rpcid, n, msg) => `   ${rpcid} 第 ${n} 次失败：${msg}`,
+    untitled: '(无标题)',
+    listStatus: '获取对话列表…',
+    listAction: '获取对话列表',
+    listProgress: (n) => `获取对话列表… 已找到 ${n} 个`,
+    listFound: (n) => `📋 共 ${n} 个对话`,
+    readAction: (t) => `读取：${t}`,
+    exportLine: (i, n, total, fresh) => `导出中 ${i}/${n}（共 ${total} 个，${fresh} 个已是最新）\n`,
+    exportStats: (fails, sec) => `失败 ${fails} · 用时 ${sec}s`,
+    background: '\n（后台运行中）',
+    noMessages: '没有读到任何消息',
+    okLine: (i, n, title, turns) => `✅ [${i}/${n}] ${title}（${turns} 轮）`,
+    generating: '正在生成文件…',
+    generatingAction: '生成文件',
+    nothing: '没有导出任何对话',
+    nothingAlert: '没有导出任何对话，详情见 Console',
+    downloadAction: (f) => '下载 ' + f,
+    dlButton: (f, mb) => `⬇️ 没自动下载？点这里下载 ${f}（${mb} MB）`,
+    reportFile: '_导出报告.json',
+    mergedTitle: (time, n) => `# Gemini 对话全量导出\n\n> 导出时间：${time}\n> 对话总数：${n}\n\n---\n\n`,
+    summary: (ok, total, exported, fails, missing) =>
+      (ok ? '✅ 全部完成' : '⚠️ 已保存，但有未完成项') +
+      `\n列表共 ${total} 个 · 已导出 ${exported} 个\n失败 ${fails} 个 · 未导出 ${missing} 个` +
+      (ok ? '' : '\n再运行一次选"增量更新"即可补齐') +
+      '\n如果浏览器没有自动下载，点上面绿色的下载按钮',
+    errorStatus: (m) => '❌ 出错了：' + m + '\n已导出的部分已保存，重新运行选"增量更新"即可继续',
+    errorLog: '❌ 出错：',
+    modePrompt: '请选择导出模式：\n' +
+      '  1 = JSON 打包 ZIP（每个对话一个 .json）\n' +
+      '  2 = Markdown 打包 ZIP（每个对话一个 .md）\n' +
+      '  3 = JSON 合并成一个文件\n' +
+      '  4 = Markdown 合并成一个文件\n' +
+      '  5 = 校验当前对话（先测试用）\n\n输入 1-5：',
+    incrConfirm: (n) => `发现之前导出过 ${n} 个对话。\n\n确定 = 增量更新（只导新对话和有更新的对话，最后打包全部）\n取消 = 清空，全部重新导出`,
+    verifyNeedConv: '请先打开一个对话（网址是 /app/一串字符），再选模式 5',
+    verifyReading: '用接口读取当前对话…',
+    verifyResult: (turns, msgs, dom, fewer, incomplete) =>
+      `接口读到 ${turns} 轮（${msgs} 条消息）\n页面上当前显示 ${dom} 条提问` +
+      (fewer ? '\n⚠️ 接口读到的比页面少，请把这行告诉作者' : '\n✅ 接口没有比页面少（页面可能只显示了一部分）') +
+      (incomplete ? '\n⚠️ 检测到无法使用的翻页标记' : ''),
+    mdStarted: '开始时间：',
+    mdUpdated: '最后更新：',
+    mdMessages: '消息数：',
+    mdLink: '原始链接：',
+    mdIncomplete: '⚠️ 可能不完整',
+    roleUser: '👤 用户',
+    roleAssistant: '🤖 Gemini',
+  } : {
+    locale: 'en-CA',
+    alreadyRunning: 'The exporter is already running.',
+    wrongHost: 'Please run this on https://gemini.google.com',
+    noToken: 'Could not find the auth token on this page. Make sure you are signed in, then refresh and run again.',
+    panelTitle: 'Gemini Exporter (API)',
+    preparing: 'Preparing…',
+    preparingAction: 'preparing',
+    stop: 'Stop and save what is exported',
+    stopping: 'Wrapping up and building files…',
+    keepAwake: '🔊 Keep tab awake',
+    keepAwakeTitle: 'Plays near-silent audio so the browser will not freeze a tab that is playing sound',
+    keepOn: '✅ On',
+    keepFail: 'Failed',
+    beat: (action, sec) => `Doing: ${action} · last activity ${sec}s ago`,
+    requestAction: (rpcid, n) => `request ${rpcid} (attempt ${n})`,
+    authExpired: (s) => `Session expired (HTTP ${s}). Refresh the page and run again — your progress is kept.`,
+    badFormat: 'Could not parse the response',
+    apiError: (e) => 'API returned an error ' + e,
+    timeout: (s) => `No response after ${s}s`,
+    requestFailed: 'Request failed',
+    retryWarn: (rpcid, n, msg) => `   ${rpcid} attempt ${n} failed: ${msg}`,
+    untitled: '(untitled)',
+    listStatus: 'Fetching conversation list…',
+    listAction: 'fetching conversation list',
+    listProgress: (n) => `Fetching conversation list… ${n} found`,
+    listFound: (n) => `📋 ${n} conversations in total`,
+    readAction: (t) => `reading: ${t}`,
+    exportLine: (i, n, total, fresh) => `Exporting ${i}/${n} (${total} in total, ${fresh} already up to date)\n`,
+    exportStats: (fails, sec) => `${fails} failed · ${sec}s elapsed`,
+    background: '\n(running in the background)',
+    noMessages: 'No messages were read',
+    okLine: (i, n, title, turns) => `✅ [${i}/${n}] ${title} (${turns} turns)`,
+    generating: 'Building files…',
+    generatingAction: 'building files',
+    nothing: 'Nothing was exported',
+    nothingAlert: 'Nothing was exported. See the Console for details.',
+    downloadAction: (f) => 'downloading ' + f,
+    dlButton: (f, mb) => `⬇️ No download started? Click to save ${f} (${mb} MB)`,
+    reportFile: '_export-report.json',
+    mergedTitle: (time, n) => `# All Gemini conversations\n\n> Exported at: ${time}\n> Conversations: ${n}\n\n---\n\n`,
+    summary: (ok, total, exported, fails, missing) =>
+      (ok ? '✅ All done' : '⚠️ Saved, but some items are unfinished') +
+      `\n${total} in the list · ${exported} exported\n${fails} failed · ${missing} not exported` +
+      (ok ? '' : '\nRun it again and choose "incremental" to fill the gaps') +
+      '\nIf nothing downloaded automatically, click the green download button above',
+    errorStatus: (m) => '❌ Error: ' + m + '\nEverything exported so far is saved. Run again and choose "incremental" to continue.',
+    errorLog: '❌ Error:',
+    modePrompt: 'Choose an export mode:\n' +
+      '  1 = JSON as a ZIP (one .json per conversation)\n' +
+      '  2 = Markdown as a ZIP (one .md per conversation)\n' +
+      '  3 = all conversations in a single JSON file\n' +
+      '  4 = all conversations in a single Markdown file\n' +
+      '  5 = verify the current conversation (test run)\n\nEnter 1-5:',
+    incrConfirm: (n) => `Found ${n} conversations exported earlier.\n\nOK = incremental update (only new and updated conversations, then package everything)\nCancel = clear the progress and export everything from scratch`,
+    verifyNeedConv: 'Open a conversation first (the URL should contain /app/<id>), then choose mode 5',
+    verifyReading: 'Reading the current conversation through the API…',
+    verifyResult: (turns, msgs, dom, fewer, incomplete) =>
+      `The API read ${turns} turns (${msgs} messages)\nThe page currently shows ${dom} questions` +
+      (fewer ? '\n⚠️ The API returned fewer than the page — please report this line to the author' : '\n✅ The API did not return fewer than the page (the page may only render part of it)') +
+      (incomplete ? '\n⚠️ Hit an unusable pagination cursor' : ''),
+    mdStarted: 'Started: ',
+    mdUpdated: 'Last updated: ',
+    mdMessages: 'Messages: ',
+    mdLink: 'Source: ',
+    mdIncomplete: '⚠️ Possibly incomplete',
+    roleUser: '👤 User',
+    roleAssistant: '🤖 Gemini',
+  };
+
+  if (window.__GX_API_RUNNING__) { alert(T.alreadyRunning); return; }
   window.__GX_API_RUNNING__ = true;
 
   const CFG = {
@@ -69,17 +231,17 @@
       'font:12px/1.7 system-ui,sans-serif;padding:10px 14px;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.4);' +
       'max-width:360px;white-space:pre-line;border:1px solid rgba(255,255,255,.1)';
     const title = document.createElement('div');
-    title.textContent = 'Gemini 导出（接口版）';
+    title.textContent = T.panelTitle;
     title.style.cssText = 'font-weight:600;margin-bottom:4px';
     const status = document.createElement('div');
-    status.textContent = '准备中…';
+    status.textContent = T.preparing;
     const btn = document.createElement('button');
-    btn.textContent = '停止并保存已导出部分';
+    btn.textContent = T.stop;
     btn.style.cssText = 'margin-top:8px;padding:4px 12px;border:0;border-radius:6px;background:#ef4444;color:#fff;cursor:pointer;font-size:12px';
-    btn.onclick = () => { stopped = true; btn.disabled = true; btn.style.opacity = '.5'; status.textContent = '正在收尾并生成文件…'; };
+    btn.onclick = () => { stopped = true; btn.disabled = true; btn.style.opacity = '.5'; status.textContent = T.stopping; };
     const keep = document.createElement('button');
-    keep.textContent = '🔊 防止 Edge 休眠';
-    keep.title = '播放几乎听不到的声音，浏览器不会冻结正在播放声音的标签页';
+    keep.textContent = T.keepAwake;
+    keep.title = T.keepAwakeTitle;
     keep.style.cssText = 'margin:8px 0 0 8px;padding:4px 10px;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer;font-size:12px';
     keep.onclick = () => {
       try {
@@ -92,10 +254,10 @@
         osc.start();
         ctx.resume();
         window.__GX_KEEP__ = ctx;
-        keep.textContent = '✅ 已开启';
+        keep.textContent = T.keepOn;
         keep.disabled = true;
         keep.style.background = '#16a34a';
-      } catch (e) { keep.textContent = '开启失败'; }
+      } catch (e) { keep.textContent = T.keepFail; }
     };
     const beat = document.createElement('div');
     beat.style.cssText = 'color:#9ca3af;margin-top:4px';
@@ -108,10 +270,10 @@
     return box;
   }
   const setStatus = (m) => { if (panelStatus) panelStatus.textContent = m; dbg(m); };
-  let lastActivity = Date.now(), lastAction = '准备中';
+  let lastActivity = Date.now(), lastAction = T.preparingAction;
   let panelBeat = null;
   setInterval(() => {
-    if (panelBeat) panelBeat.textContent = `正在：${lastAction} · 最后活动 ${Math.round((Date.now() - lastActivity) / 1000)}s 前`;
+    if (panelBeat) panelBeat.textContent = T.beat(lastAction, Math.round((Date.now() - lastActivity) / 1000));
   }, 1000);
 
   // ==================== 接口 ====================
@@ -156,7 +318,7 @@
       let timedOut = false;
       timer(() => { timedOut = true; ac.abort(); }, CFG.REQUEST_TIMEOUT_MS);
       lastActivity = Date.now();
-      lastAction = `请求 ${rpcid}（第 ${attempt + 1} 次）`;
+      lastAction = T.requestAction(rpcid, attempt + 1);
       try {
         const res = await fetch(url, {
           method: 'POST',
@@ -165,28 +327,28 @@
           body: body.toString(),
           signal: ac.signal,
         });
-        if (res.status === 401 || res.status === 403) throw new ApiError(`登录已失效（HTTP ${res.status}），请刷新页面后重新运行（进度不会丢）`);
+        if (res.status === 401 || res.status === 403) throw new ApiError(T.authExpired(res.status));
         if (!res.ok) { lastErr = new Error(`HTTP ${res.status}`); continue; }
         const text = await res.text();
         lastActivity = Date.now();
         const parsed = parseBatch(text).find((p) => p.rpc === rpcid);
-        if (!parsed) { lastErr = new Error('返回格式无法解析'); continue; }
-        if (parsed.err) { lastErr = new Error('接口返回错误 ' + JSON.stringify(parsed.err)); continue; }
+        if (!parsed) { lastErr = new Error(T.badFormat); continue; }
+        if (parsed.err) { lastErr = new Error(T.apiError(JSON.stringify(parsed.err))); continue; }
         return parsed.inner;
       } catch (e) {
         if (e instanceof ApiError) throw e;
-        lastErr = timedOut ? new Error(`请求超过 ${CFG.REQUEST_TIMEOUT_MS / 1000}s 没有响应`) : e;
-        console.warn(`   ${rpcid} 第 ${attempt + 1} 次失败：${lastErr.message}`);
+        lastErr = timedOut ? new Error(T.timeout(CFG.REQUEST_TIMEOUT_MS / 1000)) : e;
+        console.warn(T.retryWarn(rpcid, attempt + 1, lastErr.message));
       }
     }
-    throw lastErr || new Error('请求失败');
+    throw lastErr || new Error(T.requestFailed);
   }
 
   const plainId = (cid) => cid.replace(/^c_/, '');
   const convUrl = (cid) => `https://gemini.google.com${PREFIX}/app/${plainId(cid)}`;
   const tsToIso = (t) => (Array.isArray(t) && typeof t[0] === 'number'
     ? new Date(t[0] * 1000 + Math.floor((t[1] || 0) / 1e6)).toISOString() : null);
-  const fmtTime = (iso) => (iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false }) : '');
+  const fmtTime = (iso) => (iso ? new Date(iso).toLocaleString(T.locale, { hour12: false }) : '');
 
   // ---- 对话列表（实测：MaZiqc，返回 [_, 翻页标记, [[c_id, 标题, _, _, _, [秒, 纳秒], ...], ...]]）----
   async function listAll(onProgress) {
@@ -202,7 +364,7 @@
         for (const it of items) {
           const cid = it && it[0];
           if (typeof cid !== 'string' || all.has(cid)) continue;
-          all.set(cid, { cid, title: it[1] || '(无标题)', updatedAt: tsToIso(it[5]), order: all.size });
+          all.set(cid, { cid, title: it[1] || T.untitled, updatedAt: tsToIso(it[5]), order: all.size });
           added++;
         }
         onProgress(all.size);
@@ -343,13 +505,13 @@
 
   // ==================== 输出 ====================
   function download(blob, filename) {
-    lastAction = '下载 ' + filename;
+    lastAction = T.downloadAction(filename);
     lastActivity = Date.now();
     const holder = document.getElementById('gx-api-dl');
     if (holder) {
       const b = document.createElement('button');
       const mb = (blob.size / 1048576).toFixed(1);
-      b.textContent = `⬇️ 没自动下载？点这里下载 ${filename}（${mb} MB）`;
+      b.textContent = T.dlButton(filename, mb);
       b.style.cssText = 'display:block;margin-top:8px;padding:6px 10px;border:0;border-radius:6px;background:#16a34a;color:#fff;cursor:pointer;font-size:12px;text-align:left';
       b.onclick = () => triggerDownload(blob, filename);
       holder.appendChild(b);
@@ -371,13 +533,13 @@
   function toMarkdown(r, level = 1) {
     const h = '#'.repeat(level);
     let md = `${h} ${r.title}\n\n`;
-    if (r.createdAt) md += `> 开始时间：${fmtTime(r.createdAt)}\n`;
-    if (r.updatedAt) md += `> 最后更新：${fmtTime(r.updatedAt)}\n`;
-    md += `> 消息数：${r.messageCount}\n> 原始链接：${r.url}\n`;
-    if (r.possiblyIncomplete) md += '> ⚠️ 可能不完整\n';
+    if (r.createdAt) md += `> ${T.mdStarted}${fmtTime(r.createdAt)}\n`;
+    if (r.updatedAt) md += `> ${T.mdUpdated}${fmtTime(r.updatedAt)}\n`;
+    md += `> ${T.mdMessages}${r.messageCount}\n> ${T.mdLink}${r.url}\n`;
+    if (r.possiblyIncomplete) md += `> ${T.mdIncomplete}\n`;
     md += '\n---\n\n';
     for (const m of r.messages) {
-      md += `${h}# ${m.role === 'user' ? '👤 用户' : '🤖 Gemini'}${m.time ? ' · ' + fmtTime(m.time) : ''}\n\n${m.content}\n\n`;
+      md += `${h}# ${m.role === 'user' ? T.roleUser : T.roleAssistant}${m.time ? ' · ' + fmtTime(m.time) : ''}\n\n${m.content}\n\n`;
     }
     return md;
   }
@@ -385,15 +547,13 @@
   // ==================== 模式 5：校验 ====================
   async function verifyCurrent() {
     const m = location.pathname.match(/\/app\/([\w-]{6,})/);
-    if (!m) { alert('请先打开一个对话（网址是 /app/一串字符），再选模式 5'); return; }
+    if (!m) { alert(T.verifyNeedConv); return; }
     const cid = 'c_' + m[1];
-    setStatus('用接口读取当前对话…');
+    setStatus(T.verifyReading);
     const rr = await readConversation(cid);
     const rec = buildRecord({ cid, title: document.title.replace(/\s*[-–|—]\s*(Google\s+)?Gemini.*$/i, '') || cid, order: 0 }, rr);
     const domTurns = document.querySelectorAll('user-query').length;
-    const msg = `接口读到 ${rec.turnCount} 轮（${rec.messageCount} 条消息）\n页面上当前显示 ${domTurns} 条提问` +
-      (domTurns > rec.turnCount ? '\n⚠️ 接口读到的比页面少，请把这行告诉作者' : '\n✅ 接口没有比页面少（页面可能只显示了一部分）') +
-      (rr.possiblyIncomplete ? '\n⚠️ 检测到无法使用的翻页标记' : '');
+    const msg = T.verifyResult(rec.turnCount, rec.messageCount, domTurns, domTurns > rec.turnCount, rr.possiblyIncomplete);
     setStatus(msg);
     console.log(msg);
     const base = sanitize(rec.title);
@@ -404,17 +564,11 @@
 
   // ==================== 主流程 ====================
   async function run() {
-    if (!location.hostname.includes('gemini.google.com')) { alert('请在 https://gemini.google.com 页面运行'); return; }
-    if (!AT) { alert('页面上找不到登录令牌，请确认已登录，并刷新页面后再运行'); return; }
+    if (!location.hostname.includes('gemini.google.com')) { alert(T.wrongHost); return; }
+    if (!AT) { alert(T.noToken); return; }
     createPanel();
 
-    const choice = (prompt(
-      '请选择导出模式：\n' +
-      '  1 = JSON 打包 ZIP（每个对话一个 .json）\n' +
-      '  2 = Markdown 打包 ZIP（每个对话一个 .md）\n' +
-      '  3 = JSON 合并成一个文件\n' +
-      '  4 = Markdown 合并成一个文件\n' +
-      '  5 = 校验当前对话（先测试用）\n\n输入 1-5：', '1') || '').trim();
+    const choice = (prompt(T.modePrompt, '1') || '').trim();
     if (choice === '5') { await verifyCurrent(); return; }
     const modes = { 1: ['json', 'zip'], 2: ['md', 'zip'], 3: ['json', 'merge'], 4: ['md', 'merge'] };
     if (!modes[choice]) { document.getElementById('gx-api-panel')?.remove(); return; }
@@ -422,17 +576,16 @@
 
     await store.open();
     const prev = await store.all();
-    if (prev.length && !confirm(
-      `发现之前导出过 ${prev.length} 个对话。\n\n确定 = 增量更新（只导新对话和有更新的对话，最后打包全部）\n取消 = 清空，全部重新导出`)) {
+    if (prev.length && !confirm(T.incrConfirm(prev.length))) {
       await store.clear();
     }
     const saved = new Map((await store.all()).map((r) => [r.conversationId, r]));
 
-    // 1. 拉全部对话列表
-    setStatus('获取对话列表…');
-    lastAction = '获取对话列表';
-    const list = await listAll((n) => setStatus(`获取对话列表… 已找到 ${n} 个`));
-    console.log(`📋 共 ${list.size} 个对话`);
+    // 1. 拉全部对话列表 / fetch the full conversation list
+    setStatus(T.listStatus);
+    lastAction = T.listAction;
+    const list = await listAll((n) => setStatus(T.listProgress(n)));
+    console.log(T.listFound(list.size));
 
     // 2. 需要导出的：没导过的 + 有更新的 + 上次可能不完整的
     const todo = [...list.values()].filter((c) => {
@@ -444,33 +597,33 @@
 
     for (let i = 0; i < todo.length && !stopped; i++) {
       const c = todo[i];
-      lastAction = `读取：${c.title.slice(0, 16)}`;
+      lastAction = T.readAction(c.title.slice(0, 16));
       const sec = Math.round((Date.now() - t0) / 1000);
-      setStatus(`导出中 ${i + 1}/${todo.length}（共 ${list.size} 个，${saved.size} 个已是最新）\n${c.title.slice(0, 30)}\n失败 ${failures.length} · 用时 ${sec}s` +
-        (document.hidden ? '\n（后台运行中）' : ''));
+      setStatus(T.exportLine(i + 1, todo.length, list.size, saved.size) + `${c.title.slice(0, 30)}\n` + T.exportStats(failures.length, sec) +
+        (document.hidden ? T.background : ''));
       try {
         const rec = buildRecord(c, await readConversation(c.cid));
-        if (rec.messageCount === 0) throw new Error('没有读到任何消息');
+        if (rec.messageCount === 0) throw new Error(T.noMessages);
         await store.put(rec);
         saved.set(rec.conversationId, rec);
-        console.log(`✅ [${i + 1}/${todo.length}] ${rec.title}（${rec.turnCount} 轮）`);
+        console.log(T.okLine(i + 1, todo.length, rec.title, rec.turnCount));
       } catch (e) {
         if (e instanceof ApiError) { alert(e.message); stopped = true; break; }
         failures.push({ title: c.title, url: convUrl(c.cid), reason: e.message });
-        console.warn(`⚠️ ${c.title}：${e.message}`);
+        console.warn(`⚠️ ${c.title}: ${e.message}`);
       }
       await sleep(CFG.DELAY_MS);
     }
 
-    // 3. 生成文件（包含以前导出过的全部）
-    setStatus('正在生成文件…');
-    lastAction = '生成文件'; lastActivity = Date.now();
+    // 3. 生成文件（包含以前导出过的全部）/ build the files (everything, including earlier runs)
+    setStatus(T.generating);
+    lastAction = T.generatingAction; lastActivity = Date.now();
     await sleep(50);
     const records = [...saved.values()].sort((a, b) => {
       const oa = list.get(a.conversationId)?.order ?? 1e9, ob = list.get(b.conversationId)?.order ?? 1e9;
       return oa - ob;
     });
-    if (!records.length) { setStatus('没有导出任何对话'); alert('没有导出任何对话，详情见 Console'); return; }
+    if (!records.length) { setStatus(T.nothing); alert(T.nothingAlert); return; }
 
     const missing = [...list.values()].filter((c) => !saved.has(c.cid)).map((c) => ({ title: c.title, url: convUrl(c.cid) }));
     const report = {
@@ -485,22 +638,20 @@
         name: `${String(i + 1).padStart(4, '0')}_${sanitize(r.title)}.${format === 'json' ? 'json' : 'md'}`,
         content: format === 'json' ? JSON.stringify(strip(r), null, 2) : toMarkdown(r),
       }));
-      files.push({ name: '_导出报告.json', content: JSON.stringify(report, null, 2) });
+      files.push({ name: T.reportFile, content: JSON.stringify(report, null, 2) });
       download(createZip(files), `gemini_chats_${stamp}.zip`);
     } else if (format === 'json') {
       downloadText(JSON.stringify({ platform: 'Google Gemini', exportedAt: new Date().toISOString(),
         totalConversations: records.length, conversations: records.map(strip), report }, null, 2),
       `gemini_all_${stamp}.json`, 'application/json;charset=utf-8');
     } else {
-      let md = `# Gemini 对话全量导出\n\n> 导出时间：${fmtTime(new Date().toISOString())}\n> 对话总数：${records.length}\n\n---\n\n`;
+      let md = T.mergedTitle(fmtTime(new Date().toISOString()), records.length);
       for (const r of records) md += toMarkdown(r, 2) + '\n---\n\n';
       downloadText(md, `gemini_all_${stamp}.md`, 'text/markdown;charset=utf-8');
     }
 
     const ok = !stopped && !failures.length && !missing.length;
-    const summary = `${ok ? '✅ 全部完成' : '⚠️ 已保存，但有未完成项'}\n列表共 ${list.size} 个 · 已导出 ${records.length} 个\n` +
-      `失败 ${failures.length} 个 · 未导出 ${missing.length} 个` + (ok ? '' : '\n再运行一次选"增量更新"即可补齐') +
-      '\n如果浏览器没有自动下载，点上面绿色的下载按钮';
+    const summary = T.summary(ok, list.size, records.length, failures.length, missing.length);
     setStatus(summary);
     console.log(summary);
     if (failures.length) console.table(failures);
@@ -509,8 +660,8 @@
   try {
     await run();
   } catch (e) {
-    console.error('❌ 出错：', e);
-    setStatus('❌ 出错了：' + (e && e.message) + '\n已导出的部分已保存，重新运行选"增量更新"即可继续');
+    console.error(T.errorLog, e);
+    setStatus(T.errorStatus(e && e.message));
   } finally {
     window.__GX_API_RUNNING__ = false;
   }

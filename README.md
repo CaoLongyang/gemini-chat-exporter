@@ -2,6 +2,8 @@
 
 **用一段 JS 脚本，导出 Google Gemini 的全部聊天记录（JSON / Markdown，带时间）。**
 
+**中文** · [English](#english)
+
 在浏览器 Console 里粘贴运行即可，不用装扩展、不用装软件。脚本直接调用 Gemini 网页自己使用的内部接口，所以：
 
 - ✅ **导出全部对话**：自动翻页拿到完整的对话列表，不依赖侧边栏是否展开
@@ -33,6 +35,8 @@
    如果浏览器没有自动下载，点右下角面板里绿色的 **⬇️ 下载** 按钮。
 
 **建议第一次先打开一个很长的对话，用模式 5 校验一下**，确认内容和时间都对，再跑全量。
+
+> **界面语言**：跟随浏览器语言自动切换——中文浏览器显示中文，其他语言显示英文。想强制指定，运行前在 Console 执行 `window.__GX_LANG__ = 'zh'`（或 `'en'`）。
 
 ### 长时间后台运行（Edge 用户请看）
 
@@ -120,5 +124,141 @@ DEVELOPMENT.md            开发过程中遇到的困难和解决办法
 本项目与 Google 无关，是非官方工具，仅用于导出你自己的数据。使用内部接口可能不符合服务条款的某些要求，请自行判断并承担风险。
 
 ## License
+
+[MIT](LICENSE)
+
+---
+
+<a id="english"></a>
+
+## English
+
+**Export every Google Gemini conversation with one paste-in script — JSON or Markdown, with timestamps.**
+
+Paste it into the browser Console on <https://gemini.google.com/app>. No extension, nothing to install. The script calls the same internal endpoints the Gemini web app itself uses, so:
+
+- ✅ **Every conversation** — it paginates through the full list instead of relying on the sidebar being expanded
+- ✅ **Timestamps everywhere** — every message, plus a start time and a last-updated time per conversation
+- ✅ **Runs in the background** — no clicking, no scrolling; switching tabs or minimizing the window is fine
+- ✅ **Resumable and incremental** — each conversation is saved in your browser as it is read; a later run only fetches new or updated conversations
+- ✅ **Read-only** — it never modifies or deletes anything
+
+> 中文说明见[上半部分](#gemini-chat-exporter)。
+
+### Usage
+
+1. Open <https://gemini.google.com/app> in Chrome or Edge and sign in
+   (with several Google accounts, switch to the one you want to export first)
+2. Press `F12` and open the **Console** tab
+3. Copy all of [`gemini-export.js`](gemini-export.js), paste it in, press Enter
+   (the first paste may require you to type `allow pasting` first)
+4. Pick a mode in the dialog:
+
+| Mode | Output |
+|---|---|
+| `1` | JSON as a ZIP — one `.json` per conversation |
+| `2` | Markdown as a ZIP — one `.md` per conversation |
+| `3` | all conversations in a single `.json` |
+| `4` | all conversations in a single `.md` |
+| `5` | **verify** — export only the open conversation and compare its message count with the page |
+
+5. Switch tabs or minimize; the download starts when it finishes. If nothing downloads, click the green **⬇️** button in the panel at the bottom right.
+
+**Run mode 5 on a very long conversation first** to confirm the content and timestamps look right before a full export.
+
+### UI language
+
+The interface follows your browser language: Chinese browsers get Chinese, everything else gets English. To force it, set `window.__GX_LANG__ = 'en'` (or `'zh'`) in the Console before running.
+
+### Long background runs (Edge)
+
+Edge puts background tabs to "sleep" and freezes everything inside them. Do one of these:
+
+- Open `edge://settings/system` and add `gemini.google.com` to "Never put these sites to sleep", or
+- Click **🔊 Keep tab awake** in the panel — it plays near-inaudible audio, and browsers do not freeze a tab that is playing sound
+
+### Incremental updates
+
+On a second run the script asks whether to update incrementally:
+
+- **OK** — export only new conversations, updated conversations and ones that failed last time, then package everything (including what was exported earlier)
+- **Cancel** — clear the saved progress and export everything from scratch
+
+Progress is kept in the browser's IndexedDB (`gemini-export-api`). To remove it when you no longer need it:
+
+```js
+indexedDB.deleteDatabase('gemini-export-api')
+```
+
+### Output format
+
+#### JSON
+
+```json
+{
+  "conversationId": "c_xxxxxxxxxxxxxxxx",
+  "title": "Example conversation",
+  "url": "https://gemini.google.com/app/xxxxxxxxxxxxxxxx",
+  "createdAt": "2026-11-18T11:08:20.000Z",
+  "updatedAt": "2026-11-25T09:46:40.500Z",
+  "exportedAt": "2026-11-25T13:35:47.337Z",
+  "turnCount": 2,
+  "messageCount": 4,
+  "messages": [
+    { "role": "user", "time": "2026-11-18T11:08:20.000Z", "content": "…" },
+    { "role": "assistant", "time": "2026-11-18T11:08:20.000Z", "content": "…(Markdown source)" }
+  ]
+}
+```
+
+#### Markdown
+
+```markdown
+# Example conversation
+
+> Started: 2026-11-18, 19:08:20
+> Last updated: 2026-11-25, 17:46:40
+> Messages: 4
+> Source: https://gemini.google.com/app/xxxxxxxxxxxxxxxx
+
+---
+
+## 👤 User · 2026-11-18, 19:08:20
+……
+
+## 🤖 Gemini · 2026-11-18, 19:08:20
+……
+```
+
+ZIP exports also contain `_export-report.json`, listing any conversations that failed, were not exported, or may be incomplete.
+
+### Known limitations
+
+- **Depends on undocumented internal endpoints** (`MaZiqc` and `hNvQHb` in `batchexecute`). A Google redesign can break it — use [`tools/probe.js`](tools/probe.js) to discover the new request format.
+- **Timestamps are per turn**: the API only returns one timestamp per question/answer pair, so both messages in a turn share the same time.
+- **Text only**: uploaded images and files, and images generated by Gemini, are not exported.
+- **Multiple response drafts**: only the one you finally selected is exported.
+- **Pagination for very long conversations** has not been fully validated against real oversized conversations; run mode 5 first.
+
+### Repository layout
+
+```
+gemini-export.js              main script (API edition, recommended)
+tools/probe.js                endpoint probe — find the new request format after a Gemini redesign
+legacy/gemini-export-dom.js   older edition: clicks and scrolls the page (no timestamps, no background run, reference only)
+DEVELOPMENT.md                build notes: the problems hit and how they were solved (Chinese)
+```
+
+### Security and privacy
+
+- Everything runs in your own browser. No data is sent to any third-party server.
+- It only uses your current signed-in session to read **your own** conversations.
+- Read the code before pasting anything into a Console. Never run Console scripts from unknown sources.
+
+### Disclaimer
+
+Not affiliated with Google. This is an unofficial tool, intended for exporting your own data. Using internal endpoints may conflict with parts of the Terms of Service — use at your own discretion.
+
+### License
 
 [MIT](LICENSE)
